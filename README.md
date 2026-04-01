@@ -1,105 +1,320 @@
-# Branch Ranking MIP — Neural B&B Solver
+# RankingBasedBB: Branch Ranking + Neural UCT Node Selection
 
-Implementation of **Branch Ranking** (Huang et al., ECML-PKDD 2022) with an added
-**Neural UCT Node Selector** as a novel contribution on top.
+A research-oriented implementation of **learning-based Branch-and-Bound (B&B)** for Mixed Integer Programming (MIP), combining:
 
-## Architecture
+* 📌 **Branch Ranking (ECML-PKDD 2022)**
+* 📌 **GCN-based variable selection (Gasse et al., NeurIPS 2019)**
+* 🆕 **Neural UCT Node Selection (novel contribution)**
+
+---
+
+## 🚀 Overview
+
+This project implements a **learning-to-branch pipeline** where:
+
+1. A **Graph Convolutional Network (GCN)** learns to select branching variables.
+2. A **Node Selection MLP** learns to guide tree traversal using a **Neural UCT strategy**.
+3. Training is performed via **offline reinforcement learning** using hybrid search.
+
+---
+
+## 🧠 Key Contributions
+
+### ✅ Implemented (from literature)
+
+* **MDP formulation of branching**
+* **Hybrid search data collection**
+* **Ranking-based reward assignment**
+* **Bipartite GCN architecture**
+* **Offline RL training objective**
+* **Benchmarks (4 problem classes)**
+
+### 🆕 Novel Contribution
+
+* **Neural UCT Node Selector**
+
+  * Replaces SCIP’s fixed node selection heuristic
+  * Uses **GCN embeddings + UCT exploration term**
+  * Learns adaptive exploration/exploitation strategy
+
+---
+
+## 📂 Project Structure
 
 ```
-branch_ranking_mip/
-├── config.py                    # All hyperparameters
-├── train.py                     # Main training script
-├── evaluate.py                  # Evaluation + GO/NO GO test
+.
+├── config.py                  # Global configuration
+├── train.py                  # Main training pipeline
+├── evaluate.py               # Evaluation + GO/NO-GO test
+├── smoke_test.py             # Sanity checks
+│
 ├── data/
-│   ├── instance_generator.py    # 4 benchmark MIP classes
-│   └── feature_extractor.py     # Bipartite graph features from SCIP
+│   ├── instance_generator.py # Generate MIP instances
+│   ├── feature_extractor.py  # Graph features from SCIP
+│
 ├── models/
-│   ├── gcn.py                   # Bipartite GCN (Gasse et al. architecture)
-│   └── node_mlp.py              # Node selector MLP (our addition)
+│   ├── gcn.py                # Branching GCN
+│   ├── node_mlp.py           # Node selection MLP
+│
 ├── training/
-│   ├── data_collector.py        # Hybrid search data collection
-│   ├── reward_assigner.py       # Ranking-based reward (top-p% + SB)
-│   └── trainer.py               # GCN + NodeMLP training loops
+│   ├── data_collector.py     # Hybrid search data collection
+│   ├── reward_assigner.py    # Reward labeling
+│   ├── trainer.py            # Training loops
+│
 ├── branching/
-│   └── branch_rule.py           # PySCIPOpt Branchrule plugin
+│   └── branch_rule.py        # Learned branching rule
+│
 ├── node_selection/
-│   └── node_selector.py         # Neural UCT Nodesel plugin ← our contribution
-└── utils/
-    ├── embedding_cache.py        # Shared GCN embedding cache
-    └── metrics.py                # Solve time, nodes, GO/NO GO
+│   └── node_selector.py      # Neural UCT selector
+│
+├── utils/
+│   ├── embedding_cache.py    # Shared embeddings
+│   └── metrics.py            # Evaluation metrics
+│
+├── instances/                # Generated MIP instances
+├── collected_data/           # Offline datasets
+├── checkpoints/              # Model weights
 ```
 
-## Installation (Windows + Git Bash)
+---
+
+## ⚙️ Setup
+
+### 1. Create and activate virtual environment
 
 ```bash
-# 1. Install SCIP: download from https://scipopt.org/index.php#download
-#    Set SCIP_DIR environment variable to installation path
-
-# 2. Create venv
 python -m venv venv
-source venv/Scripts/activate   # Git Bash
+source venv/Scripts/activate   # Git Bash (Windows)
+```
 
-# 3. Install dependencies
+### 2. Install dependencies
+
+```bash
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```
 
-## Quick Start
+### 3. Install SCIP + PySCIPOpt
+
+Download SCIP:
+👉 https://scipopt.org/index.php#download
+
+Then verify:
 
 ```bash
-# Generate instances + collect data + train everything
-python train.py --problem setcover
-
-# Skip slow steps during development
-python train.py --problem setcover --skip-collect --skip-gcn
-
-# Evaluate
-python evaluate.py --problem setcover --difficulty easy
-
-# Collect node selection training data (needed for NodeMLP)
-python evaluate.py --collect-node-data
+python -c "import pyscipopt; m = pyscipopt.Model(); print('SCIP OK')"
 ```
 
-## Training Pipeline
+---
 
-1. **Generate instances** — Set covering, Auction, Facility Location, Indep. Set
-2. **Hybrid search collection** — K=30 rollouts per node, long-term + SB samples
-3. **Reward assignment** — top-p% long-term + best SB = reward 1, rest = 0
-4. **Train GCN** — weighted cross-entropy: `L = -Σ r(s,a) log π(a|s)`
-5. **Collect node data** — run GCN solver, log node selection events + labels
-6. **Train NodeMLP** — BCE: `L = -Σ [y log σ(f(x)) + (1-y) log(1-σ(f(x)))]`
-7. **Evaluate** — GO/NO GO: win rate ≥ 60% + Wilcoxon p < 0.05
+## 🧪 Quick Test
 
-## Novel Contribution: Neural UCT Node Selector
-
-Replaces SCIP's fixed-formula hybridestim with a learned MLP score:
-
-```
-score(node) = MLP([cached_GCN_embedding(64),
-                   lowerbound_norm(1),
-                   depth_norm(1),
-                   frac_sum_norm(1),
-                   parent_visits / node_visits(1)])   ← UCT exploration term
+```bash
+python smoke_test.py
 ```
 
-- **GCN embedding**: cached when node is created during branching (free reuse)
-- **UCT term**: preserves exploration-exploitation balance from SCIP's UCT selector
-- **Learned**: trained offline from Branch Ranking trajectories with BCE loss
-- **Scope**: active for entire solve (unlike SCIP UCT which stops at 31 nodes)
+Runs ~25 checks:
 
-## Citation
+* GCN forward pass
+* embedding cache
+* reward assignment
+* NodeMLP pipeline
+
+---
+
+## 🏋️ Full Training Pipeline
+
+### Step 1 — Generate Instances
+
+```bash
+python train.py --problem setcover --skip-collect --skip-gcn --skip-node
+```
+
+Output:
 
 ```
-@inproceedings{huang2022branch,
-  title={Branch Ranking for Efficient Mixed-Integer Programming via Offline Ranking-Based Policy Learning},
-  author={Huang, Zeren and Chen, Wenhao and Zhang, Weinan and others},
-  booktitle={ECML-PKDD},
-  year={2022}
-}
-
-@inproceedings{gasse2019exact,
-  title={Exact Combinatorial Optimization with Graph Convolutional Neural Networks},
-  author={Gasse, Maxime and Ch{\'e}telat, Didier and Ferroni, Nicola and Charlin, Laurent and Lodi, Andrea},
-  booktitle={NeurIPS},
-  year={2019}
-}
+instances/{problem}/{train,val}/
 ```
+
+---
+
+### Step 2 — Collect Offline Data (Slow ⚠️)
+
+```bash
+python train.py --problem setcover --skip-gcn --skip-node
+```
+
+Output:
+
+```
+collected_data/setcover_data.pkl
+```
+
+---
+
+### Step 3 — Train GCN (Branch Ranking)
+
+```bash
+python train.py --problem setcover --skip-collect
+```
+
+Output:
+
+```
+checkpoints/setcover_gcn_best.pt
+```
+
+---
+
+### Step 4 — Collect Node Data
+
+```bash
+python evaluate.py --problem setcover --collect-node-data
+```
+
+Output:
+
+```
+collected_data/setcover_node_data.pkl
+```
+
+---
+
+### Step 5 — Train Node Selector
+
+```bash
+python train.py --problem setcover --skip-generate --skip-collect --skip-gcn
+```
+
+Output:
+
+```
+checkpoints/setcover_node_mlp.pt
+```
+
+---
+
+## 📊 Evaluation
+
+```bash
+python evaluate.py --problem setcover --difficulty easy --n-instances 20
+```
+
+### Benchmarks
+
+* Set Cover
+* Combinatorial Auction
+* Facility Location
+* Independent Set
+
+---
+
+## 🧮 Model Details
+
+### 🔹 Branching Model (GCN)
+
+* Bipartite graph: constraints ↔ variables
+* Features:
+
+  * Constraint: 5-dim
+  * Variable: 14-dim
+  * Edge: 1-dim
+* Uses:
+
+  * Prenorm layers (critical for generalization)
+  * Sum aggregation (not mean)
+
+---
+
+### 🔹 Node Selector (Neural UCT)
+
+Input (68-dim):
+
+* 64-dim GCN embedding
+* Lower bound
+* Depth
+* Fractionality
+* UCT visit ratio
+
+Architecture:
+
+```
+68 → 32 → 16 → 1 (sigmoid)
+```
+
+---
+
+## 🔄 Data Flow (During Solve)
+
+1. SCIP calls **branch rule**
+2. GCN predicts best variable
+3. Embeddings cached
+4. Node selector scores all open nodes
+5. Best node chosen via MLP + UCT
+
+---
+
+## ⚡ Key Config Parameters
+
+Edit in `config.py`:
+
+| Parameter         | Description                          |
+| ----------------- | ------------------------------------ |
+| `K_EXPLORE`       | Rollouts per node (speed vs quality) |
+| `NODE_SEL_MODE`   | `"default"` or `"neural_uct"`        |
+| `SCIP_TIME_LIMIT` | Max solve time                       |
+| `TOP_P`           | Long-term reward threshold           |
+| `SB_PROPORTION`   | Short-term data ratio                |
+
+---
+
+## 🧪 GO / NO-GO Test
+
+Compare:
+
+| Policy   | Branching | Node Selection |
+| -------- | --------- | -------------- |
+| Baseline | SCIP      | SCIP           |
+| GCN      | Learned   | SCIP           |
+| Proposed | Learned   | Neural UCT     |
+
+### Success Criteria
+
+* ✅ ≥ 60% win rate
+* ✅ Wilcoxon p-value < 0.05
+
+---
+
+## ⚠️ Known Limitations
+
+* Strong branching uses proxy (not SCIP native)
+* Node labels are simplified (can be improved)
+* Full optimal-path labeling not implemented yet
+
+---
+
+## 📌 Future Work
+
+* Integrate SCIP strong branching API
+* Improve node labeling via optimal path tracking
+* Joint training (GCN + NodeMLP)
+* Scale to larger MIP instances
+
+---
+
+## 📖 References
+
+* Huang et al., *Branch Ranking for MIP*, ECML-PKDD 2022
+* Gasse et al., *Learning to Branch*, NeurIPS 2019
+
+---
+
+## 👤 Author
+
+Developed by **Zeleckto**
+
+---
+
+## ⭐ If you find this useful
+
+Consider starring the repo and citing the work!
