@@ -20,12 +20,17 @@ N_VAL           = 2_000
 N_TEST_EACH     = 20                 # per difficulty level
 
 # ── Data Collection (Hybrid Search) ───────────────────────────────────────────
-K_EXPLORE       = 30        # number of variables sampled per node for long-term search
+
+#K_EXPLORE       = 30        # number of variables sampled per node for long-term search
 TOP_P           = 0.10      # top-p% trajectories labelled long-term promising
 SB_PROPORTION   = 0.70      # h: fraction of short-term (SB) samples in final dataset
-N_TRAIN_SAMPLES = 50_000    # state-action pairs for GCN training
+#N_TRAIN_SAMPLES = 50_000    # state-action pairs for GCN training
 N_VAL_SAMPLES   = 5_000
-SCIP_TIME_LIMIT = 3600      # seconds per instance during collection
+#SCIP_TIME_LIMIT = 3600      # seconds per instance during collection
+K_EXPLORE       = 3
+N_TRAIN_SAMPLES = 50_00
+SCIP_TIME_LIMIT = 120
+
 
 # ── GCN Architecture ──────────────────────────────────────────────────────────
 CONSTRAINT_FEAT_DIM = 5     # per-constraint features
