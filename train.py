@@ -57,107 +57,120 @@ def main():
     np.random.seed(cfg.SEED)
     torch.manual_seed(cfg.SEED)
 
+    print(f"\nDevice: {device}")
+    if device == "cuda":
+        import torch
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
     # ── Step 1: Generate instances ─────────────────────────────────────────────
     if not args.skip_generate:
         print(f"\n[1/5] Generating {pt} instances...")
         instance_dir = os.path.join(cfg.INSTANCE_DIR, pt, cfg.TRAIN_SIZE)
         train_paths  = generate_instances(pt, cfg.TRAIN_SIZE,
-                                          n_instances=200,   # small for quick test
+                                          n_instances=200,
                                           out_dir=instance_dir)
         val_dir   = os.path.join(cfg.INSTANCE_DIR, pt, "val")
         val_paths = generate_instances(pt, cfg.TRAIN_SIZE,
                                         n_instances=50,
                                         out_dir=val_dir,
                                         seed=cfg.SEED + 1)
+        print(f"  Generated {len(train_paths)} train, {len(val_paths)} val instances")
     else:
         instance_dir = os.path.join(cfg.INSTANCE_DIR, pt, cfg.TRAIN_SIZE)
         val_dir      = os.path.join(cfg.INSTANCE_DIR, pt, "val")
-        train_paths  = [os.path.join(instance_dir, f)
-                        for f in os.listdir(instance_dir) if f.endswith('.lp')]
-        val_paths    = [os.path.join(val_dir, f)
-                        for f in os.listdir(val_dir) if f.endswith('.lp')] \
+        train_paths  = sorted([os.path.join(instance_dir, f)
+                        for f in os.listdir(instance_dir) if f.endswith('.lp')]) \
+                       if os.path.exists(instance_dir) else []
+        val_paths    = sorted([os.path.join(val_dir, f)
+                        for f in os.listdir(val_dir) if f.endswith('.lp')]) \
                        if os.path.exists(val_dir) else []
         print(f"  Found {len(train_paths)} train, {len(val_paths)} val instances")
+
+    # Early exit: if only generating instances, nothing else to do
+    if args.skip_collect and args.skip_gcn and args.skip_node:
+        print("\nInstance generation complete.")
+        return
 
     # ── Step 2: Collect offline data ───────────────────────────────────────────
     data_path = os.path.join(cfg.DATA_DIR, f"{pt}_data.pkl")
     if not args.skip_collect:
         print(f"\n[2/5] Collecting offline data (hybrid search)...")
-        print("  Note: This is slow — K rollouts per node. Reduce K_EXPLORE in config for testing.")
-        collect_dataset(train_paths[:50],  # use subset for speed
-                        data_path, use_long_term=True)
+        print(f"  K_EXPLORE={cfg.K_EXPLORE}, SCIP_TIME_LIMIT={cfg.SCIP_TIME_LIMIT}s")
+        print(f"  Using {min(50, len(train_paths))} instances for collection")
+        collect_dataset(train_paths[:50], data_path, use_long_term=True)
     else:
+        if not os.path.exists(data_path):
+            print(f"\nERROR: --skip-collect specified but {data_path} does not exist.")
+            print("  Run without --skip-collect first to generate the data.")
+            return
         print(f"  Skipping data collection, loading from {data_path}")
 
     # ── Step 3: Reward assignment ──────────────────────────────────────────────
-    print(f"\n[3/5] Assigning rewards...")
-    lt_groups, sb_samples = load_dataset(data_path)
+    # Only runs if GCN or NodeMLP training is requested
+    if not args.skip_gcn or not args.skip_node:
+        print(f"\n[3/5] Assigning rewards...")
+        lt_groups, sb_samples = load_dataset(data_path)
 
-    # Long-term reward assignment
-    lt_flat = assign_long_term_rewards(lt_groups, top_p=cfg.TOP_P)
+        lt_flat    = assign_long_term_rewards(lt_groups, top_p=cfg.TOP_P)
+        sb_samples = assign_short_term_rewards(sb_samples)
 
-    # Short-term reward assignment
-    sb_samples = assign_short_term_rewards(sb_samples)
+        h = {"setcover": 0.70, "auction": 0.90, "facility": 0.95, "indset": 0.90}.get(pt, cfg.SB_PROPORTION)
+        combined_samples, train_graphs, train_rewards = build_training_dataset(lt_flat, sb_samples, h=h)
 
-    # Build combined training dataset
-    h = {"setcover": 0.70, "auction": 0.90, "facility": 0.95, "indset": 0.90}.get(pt, cfg.SB_PROPORTION)
-    combined_samples, train_graphs, train_rewards = build_training_dataset(lt_flat, sb_samples, h=h)
-
-    print(f"  Training samples: {len(train_graphs)} "
-          f"(LT: {sum(s.is_long_term for s in combined_samples)}, "
-          f"SB: {sum(s.is_short_term for s in combined_samples)})")
+        n_lt = sum(s.is_long_term  for s in combined_samples)
+        n_sb = sum(s.is_short_term for s in combined_samples)
+        print(f"  Training samples: {len(train_graphs)}  (LT: {n_lt}, SB: {n_sb})")
+        if len(train_graphs) == 0:
+            print("  WARNING: 0 training samples. Data collection may have failed.")
+            print("  Check that instances are solvable and K_EXPLORE > 0.")
+            return
 
     # ── Step 4: Train GCN ──────────────────────────────────────────────────────
     gcn_path = os.path.join(cfg.CHECKPOINT_DIR, f"{pt}_gcn_best.pt")
 
     if not args.skip_gcn:
-        print(f"\n[4/5] Training GCN...")
+        print(f"\n[4/5] Training GCN on {device}...")
         gcn = build_gcn(cfg)
-
-        # Initialize prenorm layers from data (Gasse's key trick)
-        initialize_prenorms(gcn, train_graphs[:1000])
+        initialize_prenorms(gcn, train_graphs[:min(1000, len(train_graphs))])
 
         trainer = GCNTrainer(gcn, device=device)
 
-        # Simple train/val split from collected data
-        split = int(0.9 * len(train_graphs))
+        split      = int(0.9 * len(train_graphs))
         train_data = (combined_samples[:split], train_graphs[:split], train_rewards[:split])
         val_data   = (combined_samples[split:], train_graphs[split:], train_rewards[split:])
 
         trainer.fit(train_data, val_data, checkpoint_dir=cfg.CHECKPOINT_DIR)
-        trainer.save(gcn_path)
+        # Save with problem-specific name
+        import shutil
+        best = os.path.join(cfg.CHECKPOINT_DIR, "gcn_best.pt")
+        if os.path.exists(best):
+            shutil.copy(best, gcn_path)
+            print(f"  Saved GCN checkpoint → {gcn_path}")
     else:
         print(f"  Skipping GCN training")
-
-    # Load GCN for node MLP training
-    gcn = build_gcn(cfg)
-    if os.path.exists(gcn_path):
-        ckpt = torch.load(gcn_path, map_location=device)
-        gcn.load_state_dict(ckpt['model_state'])
-        gcn.eval()
-        print(f"  Loaded GCN from {gcn_path}")
 
     # ── Step 5: Train NodeMLP ──────────────────────────────────────────────────
     node_mlp_path = os.path.join(cfg.CHECKPOINT_DIR, f"{pt}_node_mlp.pt")
 
     if not args.skip_node:
-        print(f"\n[5/5] Training NodeSelectorMLP...")
+        print(f"\n[5/5] Training NodeSelectorMLP on {device}...")
 
-        # Build node training labels from trajectory data
-        # NOTE: build_node_training_labels expects trajectory dicts with 'node_features'
-        # and 'optimal_path'. These need to be collected during a separate solve pass
-        # using the trained GCN. This is a TODO for full implementation.
-        # For now, we create dummy data to show the pipeline works.
-        print("  Building node selection training data...")
         node_data_path = os.path.join(cfg.DATA_DIR, f"{pt}_node_data.pkl")
+        if not os.path.exists(node_data_path):
+            print(f"  Node data not found at {node_data_path}")
+            print("  Run: python evaluate.py --collect-node-data first")
+            print("  Skipping NodeMLP training.")
+            return
 
-        if os.path.exists(node_data_path):
-            with open(node_data_path, 'rb') as f:
-                node_feats, node_labels = pickle.load(f)
-            print(f"  Loaded {len(node_feats)} node samples")
-        else:
-            print("  Node data not found — run evaluate.py with --collect-node-data first")
-            print("  Skipping NodeMLP training")
+        with open(node_data_path, 'rb') as f:
+            node_feats, node_labels = pickle.load(f)
+        print(f"  Loaded {len(node_feats)} node samples  "
+              f"(positive rate: {node_labels.mean():.2%})")
+
+        if node_labels.mean() == 0:
+            print("  WARNING: 0% positive rate. Labeling may be broken.")
+            print("  Check evaluate.py --collect-node-data output.")
             return
 
         node_mlp = NodeSelectorMLP()
