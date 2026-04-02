@@ -21,17 +21,15 @@ N_TEST_EACH     = 20                 # per difficulty level
 
 # ── Data Collection (Hybrid Search) ───────────────────────────────────────────
 
-#K_EXPLORE       = 30        # number of variables sampled per node for long-term search
+K_EXPLORE       = 30        # number of variables sampled per node for long-term search
 TOP_P           = 0.10      # top-p% trajectories labelled long-term promising
 SB_PROPORTION   = 0.70      # h: fraction of short-term (SB) samples in final dataset
-#N_TRAIN_SAMPLES = 50_000    # state-action pairs for GCN training
+N_TRAIN_SAMPLES = 50_000    # state-action pairs for GCN training
 N_VAL_SAMPLES   = 5_000
-#SCIP_TIME_LIMIT = 3600      # seconds per instance during collection
+SCIP_TIME_LIMIT = 3600      # seconds per instance during collection
 
 #Just verification runs:  
-K_EXPLORE       = 3
-N_TRAIN_SAMPLES = 50_00
-SCIP_TIME_LIMIT = 120
+
 
 
 # ── GCN Architecture ──────────────────────────────────────────────────────────
@@ -47,10 +45,10 @@ GCN_LR_DECAY        = 0.2           # multiply lr when plateau
 GCN_PATIENCE        = 10            # epochs before lr decay
 GCN_STOP_PATIENCE   = 20            # epochs before early stop
 GCN_BATCH_SIZE      = 32
-#GCN_MAX_EPOCHS      = 1000
+GCN_MAX_EPOCHS      = 1000
 GCN_WEIGHT_DECAY    = 0.0
 
-GCN_MAX_EPOCHS      = 30
+
 
 # ── Node MLP Architecture ─────────────────────────────────────────────────────
 NODE_INPUT_DIM      = EMBEDDING_DIM + 4   # embedding + [lb_norm, depth_norm, frac_norm, visit_ratio]
@@ -61,11 +59,11 @@ NODE_OUTPUT_DIM     = 1
 NODE_LR             = 1e-3
 NODE_WEIGHT_DECAY   = 1e-4
 NODE_BATCH_SIZE     = 64
-#NODE_MAX_EPOCHS     = 50
+NODE_MAX_EPOCHS     = 50
 NODE_POS_WEIGHT     = 10.0          # BCE positive class weight (optimal nodes are rare)
 JOINT_LAMBDA        = 0.1           # weight for node loss in joint training
 
-NODE_MAX_EPOCHS     = 15
+
 
 # ── Node Selector ─────────────────────────────────────────────────────────────
 NODE_SEL_MODE       = "default"     # "default" | "neural_uct" | "attention"
