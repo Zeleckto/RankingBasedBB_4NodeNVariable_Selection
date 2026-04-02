@@ -20,7 +20,9 @@ import config as cfg
 from models.gcn import build_gcn
 from models.node_mlp import NodeSelectorMLP
 from utils.embedding_cache import EmbeddingCache
-from utils.metrics import evaluate_policy, print_results, compare_policies
+from utils.metrics import evaluate_policy, print_results, compare_policies, solve_instance
+from utils.metrics import aggregate_results
+from branching.branch_rule import create_learned_branchrule, create_default_branchrule
 from branching.branch_rule import create_learned_branchrule, create_default_branchrule
 from node_selection.node_selector import create_default_selector, create_neural_uct_selector
 from data.feature_extractor import extract_bipartite_graph
@@ -247,7 +249,7 @@ def main():
         return
 
     # ── Policy 1: SCIP default ─────────────────────────────────────────────────
-    print("\n[1/3] SCIP default (relpcost + hybridestim)...")
+    print("\n[1/4] SCIP default (relpcost + hybridestim)...")
     default_agg = evaluate_policy(
         paths,
         branchrule_factory=lambda: None,
@@ -255,16 +257,10 @@ def main():
         n_seeds=args.n_seeds,
         time_limit=cfg.EVAL_TIME_LIMIT
     )
-    print_results("SCIP Default", default_agg)
+    print_results("SCIP Default (relpcost + hybridestim)", default_agg)
 
-    # ── Policy 2: GCN branching + SCIP node selection ─────────────────────────
-    print("\n[2/3] GCN branching + SCIP node selection...")
-
-    def gcn_only_factory():
-        # Each call creates a fresh bundle; no node MLP = default node sel
-        b = SolverBundle(gcn, node_mlp=None, device=device)
-        return b.br, b.ns
-
+    # ── Policy 2: GCN branching + SCIP hybridestim (default node sel) ─────────
+    print("\n[2/4] GCN branching + SCIP hybridestim node selection...")
     gcn_only_agg = evaluate_policy(
         paths,
         branchrule_factory=lambda: SolverBundle(gcn, None, device).br,
@@ -272,44 +268,132 @@ def main():
         n_seeds=args.n_seeds,
         time_limit=cfg.EVAL_TIME_LIMIT
     )
-    print_results("GCN + SCIP Node Sel", gcn_only_agg)
+    print_results("GCN + hybridestim (variable sel only)", gcn_only_agg)
 
-    # ── Policy 3: GCN branching + Neural UCT node selection ───────────────────
+    # ── Policy 3: GCN branching + SCIP built-in UCT ────────────────────────────
+    # Uses SCIP's existing UCT node selector without any learning.
+    # This baseline isolates whether UCT structure alone (without GCN embeddings)
+    # adds value over hybridestim when combined with learned branching.
+    print("\n[3/4] GCN branching + SCIP built-in UCT node selection...")
+
+    class SCIPUCTActivator:
+        """
+        Activates SCIP's built-in UCT node selector by setting its priority
+        above hybridestim. SCIP UCT turns off after 31 nodes by default;
+        we extend this to the full solve for a fair comparison.
+        """
+        def __init__(self, model):
+            # Raise UCT priority above hybridestim's default
+            try:
+                model.setParam("nodeselection/uct/stdpriority",    1100000)
+                model.setParam("nodeselection/uct/nodelimit",       -1)   # never turn off
+            except Exception:
+                pass  # parameter may not exist in all SCIP versions
+
+    def solve_with_scip_uct(path, branch_rule, seed):
+        """Solve using GCN branching + SCIP's built-in UCT node selector."""
+        from pyscipopt import Model
+        from utils.metrics import solve_instance
+        # We use solve_instance but post-hoc activate UCT via params
+        # Since we can't easily inject param changes through solve_instance,
+        # build the model manually here.
+        import time
+        m = Model()
+        m.hideOutput(True)
+        m.setParam("limits/time",                          cfg.EVAL_TIME_LIMIT)
+        m.setParam("randomization/permutationseed",        seed)
+        m.setParam("randomization/lpseed",                 seed)
+        m.setParam("separating/maxroundsroot",             -1)
+        m.setParam("separating/maxrounds",                  0)
+        m.setParam("presolving/maxrestarts",                0)
+        # Activate SCIP's built-in UCT
+        try:
+            m.setParam("nodeselection/uct/stdpriority",    1100000)
+            m.setParam("nodeselection/uct/nodelimit",       100000)  # effectively unlimited
+        except Exception:
+            pass
+        m.readProblem(path)
+        if branch_rule is not None:
+            m.includeBranchrule(branch_rule, "gcn_br", "",
+                                priority=1_000_000, maxdepth=-1, maxbounddist=1.0)
+        t0 = time.perf_counter()
+        m.optimize()
+        elapsed = time.perf_counter() - t0
+        status = m.getStatus()
+        solved = status == 'optimal'
+        return {
+            "solve_time":      min(elapsed, cfg.EVAL_TIME_LIMIT),
+            "n_nodes":         m.getNNodes() if solved else None,
+            "status":          status,
+            "obj_val":         m.getPrimalbound(),
+            "primal_dual_gap": abs(m.getPrimalbound()-m.getDualbound())/(abs(m.getPrimalbound())+1e-8) if solved else float('inf'),
+            "solved":          solved,
+        }
+
+    uct_results = []
+    for path in paths:
+        for seed in range(args.n_seeds):
+            cache  = EmbeddingCache()
+            br     = create_learned_branchrule(gcn, cache, device)
+            r      = solve_with_scip_uct(path, br, seed)
+            r['instance'] = path
+            r['seed']     = seed
+            uct_results.append(r)
+
+    from utils.metrics import aggregate_results
+    scip_uct_agg = aggregate_results(uct_results, cfg.EVAL_TIME_LIMIT)
+    print_results("GCN + SCIP built-in UCT", scip_uct_agg)
+
+    # ── Policy 4: GCN branching + Neural UCT node selection ───────────────────
     if node_mlp is not None:
-        print("\n[3/3] GCN branching + Neural UCT node selection...")
+        print("\n[4/4] GCN branching + Neural UCT node selection (our contribution)...")
 
-        # IMPORTANT: br and ns MUST share the same cache instance.
-        # We create a list of pre-built bundles (one per solve).
-        n_solves = len(paths) * args.n_seeds
-        bundles  = [SolverBundle(gcn, node_mlp, device) for _ in range(n_solves)]
+        n_solves    = len(paths) * args.n_seeds
+        bundles     = [SolverBundle(gcn, node_mlp, device) for _ in range(n_solves)]
         bundle_iter = iter(bundles)
 
-        full_results = []
+        neural_uct_results = []
         for path in paths:
             for seed in range(args.n_seeds):
                 bundle = next(bundle_iter)
                 bundle.reset()
-                from utils.metrics import solve_instance
                 r = solve_instance(path, bundle.br, bundle.ns,
                                    cfg.EVAL_TIME_LIMIT, seed)
                 r['instance'] = path
                 r['seed']     = seed
-                full_results.append(r)
+                neural_uct_results.append(r)
 
-        from utils.metrics import aggregate_results
-        full_agg = aggregate_results(full_results, cfg.EVAL_TIME_LIMIT)
-        print_results("GCN + Neural UCT", full_agg)
+        neural_uct_agg = aggregate_results(neural_uct_results, cfg.EVAL_TIME_LIMIT)
+        print_results("GCN + Neural UCT (ours)", neural_uct_agg)
 
-        # ── GO/NO GO comparison ────────────────────────────────────────────────
-        print("\n\nGO/NO GO: GCN+NeuralUCT vs GCN+DefaultNodeSel")
-        compare_policies(gcn_only_agg, full_agg)
+        # ── Four-way GO/NO GO summary ──────────────────────────────────────────
+        print("\n" + "="*60)
+        print("  FOUR-WAY COMPARISON SUMMARY")
+        print("="*60)
+        print_results("1. SCIP Default",           default_agg)
+        print_results("2. GCN + hybridestim",       gcn_only_agg)
+        print_results("3. GCN + SCIP UCT",          scip_uct_agg)
+        print_results("4. GCN + Neural UCT (ours)", neural_uct_agg)
 
-        print("\nGO/NO GO: GCN+NeuralUCT vs SCIP Default")
-        compare_policies(default_agg, full_agg)
+        print("\n--- GO/NO GO Tests ---")
+        print("\nNeural UCT vs GCN + hybridestim (node selection contribution):")
+        compare_policies(gcn_only_agg, neural_uct_agg)
+
+        print("\nNeural UCT vs SCIP built-in UCT (learned vs heuristic UCT):")
+        compare_policies(scip_uct_agg, neural_uct_agg)
+
+        print("\nNeural UCT vs SCIP Default (full system):")
+        compare_policies(default_agg, neural_uct_agg)
+
     else:
-        print("\n[3/3] Skipped — no NodeMLP checkpoint found")
+        print("\n[4/4] Neural UCT skipped — no NodeMLP checkpoint.")
         print("  Run: python evaluate.py --collect-node-data")
         print("  Then: python train.py --skip-generate --skip-collect --skip-gcn")
+
+        # Still print three-way summary without Neural UCT
+        print("\n--- Partial Summary (no Neural UCT) ---")
+        print("\nGCN + SCIP UCT vs GCN + hybridestim:")
+        compare_policies(gcn_only_agg, scip_uct_agg)
 
     print("\nDone.")
 
