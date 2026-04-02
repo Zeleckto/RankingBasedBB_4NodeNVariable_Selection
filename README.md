@@ -112,6 +112,107 @@ The visit ratio term preserves UCT's exploration-exploitation balance. The GCN e
 
 ---
 
+## Node Selection in SCIP: What Exists and What We Challenge
+
+### The Theoretical Argument for Ignoring Node Selection
+
+The B&B literature has long held that **variable selection dominates node selection** in determining solve time. The argument is theoretically clean:
+
+> Variable selection determines the *structure* of the search tree — how many nodes exist in total. Node selection only determines the *traversal order* of that fixed tree. With infinite time, any traversal order visits the same nodes and reaches the same optimal solution.
+
+With finite time, node selection matters indirectly: expanding a node that leads quickly to a good feasible integer solution tightens the primal bound, which prunes more of the remaining tree before it is explored. But this effect is considered secondary — primal heuristics and SCIP's internal mechanisms already approximate optimal traversal. The empirical literature reinforces this: papers on learning to branch consistently show that improvements to variable selection far outpace any improvements to node selection, and most ML4CO work ignores node selection entirely.
+
+**We challenge this assumption.** Specifically, we hypothesize that when variable selection is already near-optimal (via Branch Ranking), the residual variance in solve time is partially attributable to node selection — and that structural LP information captured in GCN embeddings, which no hand-crafted node selector has ever had access to, can exploit this variance.
+
+---
+
+### Node Selectors Available in SCIP
+
+SCIP exposes a full plugin interface (`Nodesel` class in PySCIPOpt) allowing arbitrary node selection strategies to be registered at runtime. Six node selectors ship with SCIP by default:
+
+| Selector | SCIP name | Brief description |
+|---|---|---|
+| **Hybrid Estimate** *(default)* | `hybridestim` | Two-phase: plunge (DFS) then global best-estimate. Detailed below. |
+| **UCT** | `uct` | Upper Confidence Tree score balancing lower bound and visit counts. Detailed below. |
+| **Best First** | `bfs` | Always expand node with globally lowest dual bound |
+| **Depth First** | `dfs` | Always expand deepest open node |
+| **Best Estimate** | `estimate` | Score = heuristic subtree estimate from pseudocost history |
+| **Breadth First** | `breadthfirst` | Level-by-level expansion |
+| **Restart DFS** | `restartdfs` | DFS with periodic forced jumps to global best-bound node |
+
+---
+
+### SCIP's Default: `hybridestim`
+
+This is what runs in all experiments unless overridden. It is a carefully engineered two-phase strategy authored by Tobias Achterberg:
+
+**Phase 1 — Plunging (DFS-like):**
+When a node is created, SCIP checks whether to "plunge" — continue deeper along the current subtree path rather than returning to the globally best-bound node. Plunging continues while:
+- Current plunge depth is within `[minplungedepth, maxplungedepth]`
+- The gap ratio `(current_lowerbound - global_lowerbound) / (cutoffbound - global_lowerbound)` is below `maxplungequot` (default 0.25)
+
+Plunging quickly finds feasible integer solutions, which tightens the primal bound and enables aggressive pruning.
+
+**Phase 2 — Global Best-Estimate:**
+When plunging stops, the globally best-scored open node is selected:
+
+```
+score(node) = (1 - estimweight) · node_estimate  +  estimweight · node_lowerbound
+```
+
+where `node_estimate` is a heuristic prediction of the best solution reachable from this node (built from pseudocost history), `node_lowerbound` is the LP relaxation value, and `estimweight = 0.5` by default.
+
+Every `bestnodefreq`-th call, the globally best-bound node is forced to prevent deep-subtree traps.
+
+**Key limitation:** All weights and thresholds are fixed constants tuned on historical SCIP benchmarks. No adaptivity to specific problem structure, and the scoring uses only LP bound values — no graph-structural features.
+
+---
+
+### SCIP's UCT Node Selector (`uct`)
+
+Adapted from game-tree UCB by Sabharwal & Samulowitz (CPAIOR 2011). Rather than scoring all open nodes, it performs a **top-down tree walk** from the root, at each internal node selecting the child `N_i` that maximizes:
+
+```
+score(N_i) = -estimate(N_i)  +  weight · visits(parent(N_i)) / visits(N_i)
+```
+
+The second term is the **exploration bonus**: nodes visited rarely relative to their parent receive a higher score, preventing indefinite neglect of underexplored subtrees. `visits(n)` is incremented along the entire root-to-selected-leaf path after each expansion.
+
+**Three limitations our Neural UCT addresses:**
+
+| Limitation | SCIP UCT | Our Neural UCT |
+|---|---|---|
+| Information used | Lower bound + visit counts only | GCN embedding (64-dim structural LP info) + visit counts |
+| Scope | Turns off after 31 nodes by default | Active for full solve |
+| Adaptivity | `weight = 0.1` fixed constant | MLP learns problem-adaptive exploration-exploitation |
+
+---
+
+### The Experiment: Four-Way Comparison
+
+To empirically test whether node selection matters once variable selection is optimized, we run **four policies on identical problem instances and seeds**:
+
+| Policy | Variable Selection | Node Selection | Purpose |
+|---|---|---|---|
+| **SCIP Default** | relpcost (heuristic) | hybridestim | Full solver baseline |
+| **GCN + hybridestim** | Branch Ranking (learned) | hybridestim | Isolates variable selection gain |
+| **GCN + SCIP UCT** | Branch Ranking (learned) | SCIP built-in UCT | Tests existing UCT under learned branching |
+| **GCN + Neural UCT** | Branch Ranking (learned) | Learned Neural UCT (ours) | Full proposed system |
+
+The comparison among policies 2, 3, and 4 directly tests node selection in isolation — variable selection is held constant at Branch Ranking, only the node selector changes. This cleanly separates the two contributions.
+
+**The experiment is falsifiable in both directions:**
+
+> **If Neural UCT wins (GO, win rate ≥ 60%, p < 0.05):** The theoretical argument is incomplete. Structural LP information in GCN embeddings captures node quality signals that dual bounds alone cannot. Learned node selection provides significant improvement even after variable selection is optimized. This would be the first demonstration of ML-driven node selection outperforming SCIP's state-of-the-art heuristic under identical branching conditions.
+
+> **If Neural UCT does not win (NO GO):** We provide the first systematic empirical validation of the implicit assumption in the learning-to-branch literature — that once variable selection is optimized, node selection becomes a second-order effect regardless of the information available to the selector. This is also a publishable finding that justifies the community's focus on variable selection alone.
+
+The SCIP UCT baseline (policy 3) further allows us to isolate whether any improvement comes from the UCT *structure* (exploration-exploitation balance) or from the learned MLP *content* (GCN embeddings).
+
+All four policies use identical SCIP settings following the paper: cuts at root node only, no restarts, same randomization seeds.
+
+---
+
 ## Repository Structure
 
 ```
@@ -375,4 +476,4 @@ If you use this code, please cite:
 
 ---
 
-*IIT Delhi — MCD412 BTP2 — 2024-25*
+*IIT Delhi 2026*
