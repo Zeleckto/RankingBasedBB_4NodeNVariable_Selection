@@ -47,12 +47,16 @@ class PrenormLayer(nn.Module):
 
     def initialize(self, mean: np.ndarray, std: np.ndarray):
         """Call once before training with empirical stats from training data."""
-        self.beta.copy_(torch.from_numpy(mean))
-        self.sigma.copy_(torch.from_numpy(std))
+        mean = np.where(np.isfinite(mean), mean, 0.0)
+        std  = np.where(np.isfinite(std) & (std > 1e-4), std, 1.0)
+        self.beta.copy_(torch.from_numpy(mean.astype(np.float32)))
+        self.sigma.copy_(torch.from_numpy(std.astype(np.float32)))
         self._initialized = True
 
     def forward(self, x):
-        return (x - self.beta) / self.sigma
+        out = (x - self.beta) / self.sigma
+        # Clip to prevent downstream NaN from extreme raw values
+        return torch.clamp(out, -10.0, 10.0)
 
 
 class BipartiteConvLayer(nn.Module):
@@ -154,15 +158,82 @@ class BranchingGCN(nn.Module):
 
     def initialize_prenorms(self, stats: dict):
         """
-        stats: dict from feature_extractor.get_prenorm_stats()
-        Call once on training data before starting gradient updates.
+        Initialize ALL prenorm layers (input + internal conv layers) from training data.
+
+        The internal BipartiteConvLayer prenorm_c/prenorm_v normalize aggregation sums.
+        These sums scale as sqrt(avg_degree * emb_dim) and must be computed from
+        actual forward passes, NOT from raw feature statistics.
+
+        We register hooks, run forward passes on a sample of training graphs,
+        collect aggregation sums, compute mean/std, then initialize.
         """
         self.prenorm_con.initialize(stats["con_mean"], stats["con_std"])
         self.prenorm_var.initialize(stats["var_mean"], stats["var_std"])
         self.prenorm_edg.initialize(stats["edg_mean"], stats["edg_std"])
-        for layer in self.conv_layers:
-            # Reset prenorm layers inside conv (will be fitted on first forward pass stats)
-            pass
+
+        # Collect aggregation sum statistics for internal prenorms
+        # using hooks on the BipartiteConvLayer scatter_add outputs
+        if not self.conv_layers:
+            return
+
+        agg_c_samples = [[] for _ in self.conv_layers]
+        agg_v_samples = [[] for _ in self.conv_layers]
+
+        def make_hooks(layer_idx):
+            """Return hooks that capture prenorm_c and prenorm_v inputs."""
+            def hook_c(module, input, output):
+                # input[0] is the tensor passed to prenorm_c — the aggregation sum
+                agg_c_samples[layer_idx].append(input[0].detach().cpu().float())
+            def hook_v(module, input, output):
+                agg_v_samples[layer_idx].append(input[0].detach().cpu().float())
+            return hook_c, hook_v
+
+        handles = []
+        for i, layer in enumerate(self.conv_layers):
+            hc, hv = make_hooks(i)
+            handles.append(layer.prenorm_c.register_forward_hook(hc))
+            handles.append(layer.prenorm_v.register_forward_hook(hv))
+
+        # Run a few forward passes to collect stats
+        self.eval()
+        device = next(self.parameters()).device
+        graphs = stats.get("sample_graphs", [])
+
+        with torch.no_grad():
+            for graph in graphs[:min(50, len(graphs))]:
+                try:
+                    import numpy as np
+                    con = torch.from_numpy(graph["con_feats"]).float().to(device)
+                    ei  = torch.from_numpy(graph["edge_index"]).long().to(device)
+                    ef  = torch.from_numpy(graph["edge_feats"]).float().to(device)
+                    var = torch.from_numpy(graph["var_feats"]).float().to(device)
+                    msk = torch.from_numpy(graph["cand_mask"]).bool().to(device)
+                    self.forward(con, ei, ef, var, msk)
+                except Exception:
+                    continue
+
+        for h in handles:
+            h.remove()
+
+        # Compute and apply stats to each conv layer's internal prenorms
+        for i, layer in enumerate(self.conv_layers):
+            import numpy as np
+
+            if agg_c_samples[i]:
+                agg_c = torch.cat(agg_c_samples[i], dim=0).numpy()
+                agg_c = np.where(np.isfinite(agg_c), agg_c, 0.0)
+                layer.prenorm_c.initialize(
+                    agg_c.mean(0).astype(np.float32),
+                    np.maximum(agg_c.std(0), 1e-4).astype(np.float32)
+                )
+
+            if agg_v_samples[i]:
+                agg_v = torch.cat(agg_v_samples[i], dim=0).numpy()
+                agg_v = np.where(np.isfinite(agg_v), agg_v, 0.0)
+                layer.prenorm_v.initialize(
+                    agg_v.mean(0).astype(np.float32),
+                    np.maximum(agg_v.std(0), 1e-4).astype(np.float32)
+                )
 
     def forward(self, con_feats, edge_index, edge_feats, var_feats, cand_mask):
         """

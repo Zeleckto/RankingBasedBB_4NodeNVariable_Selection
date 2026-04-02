@@ -254,13 +254,11 @@ class NodeDataCollector:
         # Gives 5-20% positive rate in practice, matching expected class balance.
         optimal_path_nodes = set()
         if model.getStatus() == 'optimal' and ns.node_log:
-            opt_obj = model.getObjVal()
-            # Relative tolerance: node is "near optimal" if lb ≥ opt*(1 - ε)
-            # For minimization: lb close to opt_obj from below
-            # Use 5% relative tolerance → ~5-15% of nodes labeled positive
-            OPT_EPSILON = 0.05
-            lb_vals = np.array([lb for _, _, lb in ns.node_log])
-            lb_range = max(abs(opt_obj), 1e-8)
+            opt_obj   = model.getObjVal()
+            lb_range  = max(abs(opt_obj), 1e-8)
+            # OPT_EPSILON=0.01 (1% gap): targets 5-15% positive rate
+            # If positive rate comes out >20%, tighten further
+            OPT_EPSILON = 0.01
             for feats, nn, lb in ns.node_log:
                 rel_gap = abs(lb - opt_obj) / lb_range
                 if rel_gap <= OPT_EPSILON:

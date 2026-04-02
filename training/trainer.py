@@ -165,14 +165,35 @@ class GCNTrainer:
 
     def fit(self, train_data, val_data=None, checkpoint_dir=None):
         """
-        Full training.
-        train_data / val_data: (samples, graphs, rewards) tuples
+        Full training with resumption support.
+        If checkpoint_dir/gcn_best.pt exists, resumes from that epoch.
+        Saves gcn_latest.pt every 10 epochs for crash recovery.
         """
         train_samples, train_graphs, train_rewards = train_data
-
         print(f"GCN training: {len(train_graphs)} samples")
 
-        for epoch in range(cfg.GCN_MAX_EPOCHS):
+        # ── Resume from checkpoint if available ───────────────────────────────
+        start_epoch = 0
+        if checkpoint_dir:
+            latest_path = os.path.join(checkpoint_dir, "gcn_latest.pt")
+            best_path   = os.path.join(checkpoint_dir, "gcn_best.pt")
+            resume_path = latest_path if os.path.exists(latest_path) else (
+                          best_path   if os.path.exists(best_path)   else None)
+            if resume_path:
+                try:
+                    ckpt = torch.load(resume_path, map_location=self.device)
+                    self.model.load_state_dict(ckpt['model_state'])
+                    self.opt.load_state_dict(ckpt['opt_state'])
+                    self.best_val_loss  = ckpt.get('val_loss', float('inf'))
+                    start_epoch         = ckpt.get('epoch', 0) + 1
+                    self.patience_count = ckpt.get('patience', 0)
+                    print(f"  Resumed from epoch {start_epoch} "
+                          f"(best val_loss={self.best_val_loss:.4f})")
+                except Exception as e:
+                    print(f"  Could not resume ({e}), starting fresh")
+                    start_epoch = 0
+
+        for epoch in range(start_epoch, cfg.GCN_MAX_EPOCHS):
             train_loss = self.train_epoch(train_samples, train_graphs, train_rewards)
 
             val_str = ""
@@ -186,26 +207,34 @@ class GCNTrainer:
                     self.best_val_loss   = val_loss
                     self.patience_count  = 0
                     if checkpoint_dir:
-                        self.save(os.path.join(checkpoint_dir, "gcn_best.pt"))
+                        self.save(os.path.join(checkpoint_dir, "gcn_best.pt"),
+                                  epoch=epoch)
                 else:
                     self.patience_count += 1
                     if self.patience_count >= cfg.GCN_STOP_PATIENCE:
                         print(f"Early stop at epoch {epoch}")
                         break
 
+            # Save periodic checkpoint every 10 epochs for crash recovery
+            if checkpoint_dir and epoch % 10 == 0:
+                self.save(os.path.join(checkpoint_dir, "gcn_latest.pt"),
+                          epoch=epoch, patience=self.patience_count)
+
             if epoch % 5 == 0:
                 print(f"Epoch {epoch:4d}  train={train_loss:.4f}{val_str}")
 
         print("GCN training complete.")
 
-    def save(self, path):
+    def save(self, path, epoch=0, patience=0):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({
             'model_state': self.model.state_dict(),
             'opt_state':   self.opt.state_dict(),
             'val_loss':    self.best_val_loss,
+            'epoch':       epoch,
+            'patience':    patience,
         }, path)
-        print(f"Saved GCN checkpoint → {path}")
+        print(f"  Saved checkpoint → {path}")
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device)
@@ -217,12 +246,13 @@ class GCNTrainer:
 
 def initialize_prenorms(gcn: BranchingGCN, graphs):
     """
-    Compute empirical stats from training graphs and initialize prenorm layers.
-    Must be called BEFORE training starts (and only once).
+    Compute stats from training graphs and initialize ALL prenorm layers —
+    both the input prenorms and the internal BipartiteConvLayer prenorms.
+    Must be called BEFORE training starts (only once).
     """
     print("Initializing prenorm layers from training data stats...")
-    stats = get_prenorm_stats(graphs)
-    gcn.initialize_prenorms(stats)
+    stats = get_prenorm_stats(graphs)          # includes sample_graphs key
+    gcn.initialize_prenorms(stats)             # uses sample_graphs for conv prenorms
     print("  Done.")
     return stats
 

@@ -6,16 +6,14 @@ Input features per node (68-dim):
     lowerbound_norm    ( 1)  : (lb - root_lb) / (cutoff - root_lb)
     depth_norm         ( 1)  : depth / max_depth_seen
     frac_sum_norm      ( 1)  : sum of fractionalities / n_cols
-    visit_ratio        ( 1)  : parent_visits / (node_visits + 1)  ← UCT exploration term
+    visit_ratio        ( 1)  : parent_visits / (node_visits + 1)  <- UCT exploration term
 
 Output: scalar in [0,1] (probability that this node is on optimal path)
 
-Training: Binary Cross-Entropy
-    y=1 if node was ancestor of best primal solution in trajectory
-    y=0 otherwise
-    Positive class weight ~10x (optimal nodes are rare)
+Training: Binary Cross-Entropy with pos_weight=10 for class imbalance.
 """
 
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -38,145 +36,133 @@ class NodeSelectorMLP(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        """x: (batch, input_dim) → (batch,) scores in [0,1]"""
         return self.net(x).squeeze(-1)
 
     def score_nodes(self, node_features: np.ndarray) -> np.ndarray:
-        """
-        Convenience: score a batch of nodes.
-        node_features: (n_nodes, input_dim) numpy array
-        Returns: (n_nodes,) numpy array of scores
-        """
         self.eval()
         with torch.no_grad():
             x = torch.from_numpy(node_features).float()
             return self.forward(x).numpy()
 
 
-def build_node_features(node_embedding: np.ndarray,
-                        lowerbound: float,
-                        root_lowerbound: float,
-                        cutoff: float,
-                        depth: int,
-                        max_depth: int,
-                        frac_sum: float,
-                        n_cols: int,
-                        node_visits: int,
-                        parent_visits: int) -> np.ndarray:
-    """
-    Build the 68-dim feature vector for one node.
-    Called inside the node selector at each selection step.
-    """
-    emb = node_embedding  # (64,)
-
-    # Normalize lowerbound: how close to cutoff?
-    span = cutoff - root_lowerbound
-    lb_norm = (lowerbound - root_lowerbound) / (span + 1e-8) if span > 1e-8 else 0.0
-    lb_norm = float(np.clip(lb_norm, 0.0, 1.0))
-
-    depth_norm = float(depth) / float(max(max_depth, 1))
-
-    frac_norm = frac_sum / float(max(n_cols, 1))
-
+def build_node_features(node_embedding, lowerbound, root_lowerbound, cutoff,
+                        depth, max_depth, frac_sum, n_cols,
+                        node_visits, parent_visits) -> np.ndarray:
+    emb     = node_embedding
+    span    = cutoff - root_lowerbound
+    lb_norm = float(np.clip((lowerbound - root_lowerbound) / (span + 1e-8), 0.0, 1.0)) \
+              if span > 1e-8 else 0.0
+    depth_norm  = float(depth) / float(max(max_depth, 1))
+    frac_norm   = frac_sum / float(max(n_cols, 1))
     visit_ratio = float(parent_visits) / float(node_visits + 1)
-
-    scalar_feats = np.array([lb_norm, depth_norm, frac_norm, visit_ratio], dtype=np.float32)
-
-    return np.concatenate([emb, scalar_feats])   # (68,)
+    scalars = np.array([lb_norm, depth_norm, frac_norm, visit_ratio], dtype=np.float32)
+    return np.concatenate([emb, scalars])
 
 
 class NodeMLPTrainer:
-    """
-    Trains the NodeSelectorMLP from labeled node data.
-
-    Training data format (per sample):
-        features : np.ndarray (input_dim,)
-        label    : int  1 = on optimal path, 0 = not
-    """
-
     def __init__(self, model: NodeSelectorMLP, device='cpu'):
-        self.model = model.to(device)
-        self.device = device
+        self.model     = model.to(device)
+        self.device    = device
         self.optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=cfg.NODE_LR,
-            weight_decay=cfg.NODE_WEIGHT_DECAY
-        )
-        pos_weight = torch.tensor([cfg.NODE_POS_WEIGHT], device=device)
+            model.parameters(), lr=cfg.NODE_LR, weight_decay=cfg.NODE_WEIGHT_DECAY)
+        pos_weight     = torch.tensor([cfg.NODE_POS_WEIGHT], device=device)
         self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        # Use BCEWithLogitsLoss — remove Sigmoid from model for training stability
-        # (we add Sigmoid back via score_nodes for inference)
-
-    def train_epoch(self, features: np.ndarray, labels: np.ndarray) -> float:
-        """
-        One epoch over the dataset.
-        features : (N, input_dim)
-        labels   : (N,) binary int
-        Returns mean loss.
-        """
-        self.model.train()
-        idx = np.random.permutation(len(features))
-        total_loss = 0.0
-        n_batches  = 0
-
-        for start in range(0, len(features), cfg.NODE_BATCH_SIZE):
-            batch_idx  = idx[start:start + cfg.NODE_BATCH_SIZE]
-            x = torch.from_numpy(features[batch_idx]).float().to(self.device)
-            y = torch.from_numpy(labels[batch_idx]).float().to(self.device)
-
-            self.optimizer.zero_grad()
-            # Forward through net WITHOUT sigmoid (BCEWithLogitsLoss expects logits)
-            logits = self._forward_logits(x)
-            loss = self.criterion(logits, y)
-            loss.backward()
-            self.optimizer.step()
-
-            total_loss += loss.item()
-            n_batches  += 1
-
-        return total_loss / max(n_batches, 1)
 
     def _forward_logits(self, x):
-        """Forward pass returning logits (strip sigmoid for numerical stability)."""
-        # Temporarily bypass final sigmoid
-        net_without_sigmoid = self.model.net[:-1]   # drop last Sigmoid
-        return net_without_sigmoid(x).squeeze(-1)
+        return self.model.net[:-1](x).squeeze(-1)
 
-    def fit(self, features: np.ndarray, labels: np.ndarray,
-            val_features: np.ndarray = None, val_labels: np.ndarray = None):
-        """Full training loop with early stopping on validation loss."""
-        best_val_loss = float('inf')
-        patience_count = 0
+    def train_epoch(self, features, labels) -> float:
+        self.model.train()
+        idx = np.random.permutation(len(features))
+        total, n = 0.0, 0
+        for start in range(0, len(features), cfg.NODE_BATCH_SIZE):
+            bi = idx[start : start + cfg.NODE_BATCH_SIZE]
+            x  = torch.from_numpy(features[bi]).float().to(self.device)
+            y  = torch.from_numpy(labels[bi]).float().to(self.device)
+            self.optimizer.zero_grad()
+            loss = self.criterion(self._forward_logits(x), y)
+            loss.backward()
+            self.optimizer.step()
+            total += loss.item()
+            n     += 1
+        return total / max(n, 1)
 
-        for epoch in range(cfg.NODE_MAX_EPOCHS):
-            train_loss = self.train_epoch(features, labels)
-
-            val_str = ""
-            if val_features is not None:
-                val_loss = self._eval_loss(val_features, val_labels)
-                val_str  = f"  val_loss={val_loss:.4f}"
-                if val_loss < best_val_loss:
-                    best_val_loss  = val_loss
-                    patience_count = 0
-                else:
-                    patience_count += 1
-                    if patience_count >= 10:
-                        print(f"  Early stop at epoch {epoch}")
-                        break
-
-            if epoch % 10 == 0:
-                print(f"  NodeMLP epoch {epoch:3d}  train_loss={train_loss:.4f}{val_str}")
-
-    def _eval_loss(self, features, labels):
+    def _eval_loss(self, features, labels) -> float:
         self.model.eval()
         with torch.no_grad():
             x = torch.from_numpy(features).float().to(self.device)
             y = torch.from_numpy(labels).float().to(self.device)
-            logits = self._forward_logits(x)
-            return self.criterion(logits, y).item()
+            return self.criterion(self._forward_logits(x), y).item()
+
+    def fit(self, features, labels, val_features=None, val_labels=None,
+            checkpoint_path=None):
+        best_val   = float('inf')
+        patience   = 0
+        start      = 0
+
+        if checkpoint_path:
+            latest = checkpoint_path.replace('.pt', '_latest.pt')
+            resume = latest if os.path.exists(latest) else \
+                     checkpoint_path if os.path.exists(checkpoint_path) else None
+            if resume:
+                try:
+                    ckpt = torch.load(resume, map_location=self.device)
+                    if isinstance(ckpt, dict) and 'model_state' in ckpt:
+                        self.model.load_state_dict(ckpt['model_state'])
+                        self.optimizer.load_state_dict(ckpt['opt_state'])
+                        best_val = ckpt.get('val_loss', float('inf'))
+                        start    = ckpt.get('epoch',    0) + 1
+                        patience = ckpt.get('patience', 0)
+                    else:
+                        self.model.load_state_dict(ckpt)
+                    print(f"  NodeMLP resumed from epoch {start}")
+                except Exception as e:
+                    print(f"  NodeMLP resume failed ({e}), starting fresh")
+
+        for epoch in range(start, cfg.NODE_MAX_EPOCHS):
+            train_loss = self.train_epoch(features, labels)
+            val_str    = ""
+
+            if val_features is not None:
+                val_loss = self._eval_loss(val_features, val_labels)
+                val_str  = f"  val_loss={val_loss:.4f}"
+                if val_loss < best_val:
+                    best_val = val_loss
+                    patience = 0
+                    if checkpoint_path:
+                        self._save_full(checkpoint_path, epoch, patience, best_val)
+                else:
+                    patience += 1
+                    if patience >= 10:
+                        print(f"  Early stop at epoch {epoch}")
+                        break
+
+            if checkpoint_path and epoch % 10 == 0:
+                self._save_full(checkpoint_path.replace('.pt', '_latest.pt'),
+                                epoch, patience, best_val)
+
+            if epoch % 10 == 0:
+                print(f"  NodeMLP epoch {epoch:3d}  train_loss={train_loss:.4f}{val_str}")
+
+    def _save_full(self, path, epoch, patience, val_loss):
+        dirn = os.path.dirname(path)
+        if dirn:
+            os.makedirs(dirn, exist_ok=True)
+        torch.save({'model_state': self.model.state_dict(),
+                    'opt_state':   self.optimizer.state_dict(),
+                    'epoch':       epoch,
+                    'patience':    patience,
+                    'val_loss':    val_loss}, path)
 
     def save(self, path):
+        dirn = os.path.dirname(path)
+        if dirn:
+            os.makedirs(dirn, exist_ok=True)
         torch.save(self.model.state_dict(), path)
 
     def load(self, path):
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        ckpt = torch.load(path, map_location=self.device)
+        if isinstance(ckpt, dict) and 'model_state' in ckpt:
+            self.model.load_state_dict(ckpt['model_state'])
+        else:
+            self.model.load_state_dict(ckpt)

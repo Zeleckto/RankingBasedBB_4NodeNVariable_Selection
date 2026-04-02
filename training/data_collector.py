@@ -66,24 +66,26 @@ def get_sb_scores(model, prio_cands=None, prio_fracs=None):
 
 def get_current_var_bounds(model):
     """
-    Snapshot ALL variable bounds at the current B&B node.
+    Snapshot tightened variable bounds at the current B&B node.
 
-    This is the correct way to reconstruct the branching path for sub-solve replay.
-    Each B&B node is fully characterized by its local variable bounds — these ARE the
-    accumulated branching decisions from root to this node.
+    Uses transformed=True vars since we're inside a branchexeclp callback
+    (transform has happened). getLbLocal/getUbLocal/getLbGlobal/getUbGlobal
+    all operate on transformed vars correctly.
 
-    Returns list of (var_name, 'lb'|'ub', bound_value) for every bound that has been
-    tightened from its global (root) value.
+    The var.name here is the transformed var name. For LP-format instances
+    this matches the original var name, so the subproblem dict lookup works.
     """
     tight_bounds = []
     try:
         for var in model.getVars(transformed=True):
-            lb_local  = var.getLbLocal()
-            ub_local  = var.getUbLocal()
-            lb_global = var.getLbGlobal()
-            ub_global = var.getUbGlobal()
+            try:
+                lb_local  = var.getLbLocal()
+                ub_local  = var.getUbLocal()
+                lb_global = var.getLbGlobal()
+                ub_global = var.getUbGlobal()
+            except Exception:
+                continue
 
-            # Only record bounds actually tightened by branching
             if lb_local > lb_global + 1e-8:
                 tight_bounds.append((var.name, 'lb', lb_local))
             if ub_local < ub_global - 1e-8:
@@ -95,34 +97,50 @@ def get_current_var_bounds(model):
 
 def solve_subproblem(instance_path, tight_bounds, extra_branch, time_limit=60):
     """
-    Solve a restricted sub-B&B from the current node's bound state plus one more branch.
+    Solve a restricted sub-B&B with tightened bounds + one extra branch.
 
-    tight_bounds : list of (var_name, 'lb'|'ub', value)  — current node's bounds
-    extra_branch : (var_name, 'lb'|'ub', value)           — one additional branch to test
+    getVarByName does not exist in PySCIPOpt 6.x.
+    Correct approach: build name→var dict from m.getVars() after readProblem.
 
-    Returns:
-        n_nodes : int — B&B nodes explored (proxy for trajectory return)
-        solved  : bool
+    chgVarLb/Ub works before optimize() on original (pre-transform) variables.
     """
-    m = Model()
-    m.hideOutput(True)
-    m.setParam("limits/time", time_limit)
-    m.setParam("limits/nodes", 5000)   # cap to avoid runaway sub-solves
-    m.readProblem(instance_path)
+    try:
+        m = Model()
+        m.hideOutput(True)
+        m.setParam("limits/time",  time_limit)
+        m.setParam("limits/nodes", 5000)
+        # Match paper SCIP settings
+        m.setParam("separating/maxroundsroot", -1)
+        m.setParam("separating/maxrounds",      0)
+        m.setParam("presolving/maxrestarts",     0)
+        m.readProblem(instance_path)
 
-    # Apply all current-node bounds
-    all_bounds = tight_bounds + [extra_branch]
-    for var_name, side, bound in all_bounds:
-        var = m.getVarByName(var_name)
-        if var is None:
-            continue
-        if side == 'lb':
-            m.chgVarLb(var, float(bound))
-        else:
-            m.chgVarUb(var, float(bound))
+        # Build name → var dict (getVarByName does not exist in pyscipopt 6.x)
+        var_dict = {v.name: v for v in m.getVars()}
 
-    m.optimize()
-    return m.getNNodes(), m.getStatus() == 'optimal'
+        all_bounds = tight_bounds + [extra_branch]
+        for var_name, side, bound in all_bounds:
+            var = var_dict.get(var_name)
+            if var is None:
+                continue
+            bound_f = float(bound)
+            try:
+                if side == 'lb':
+                    m.chgVarLb(var, bound_f)
+                else:
+                    m.chgVarUb(var, bound_f)
+            except Exception:
+                # If chgVarLb/Ub fails (wrong stage, infeasible bound), skip
+                pass
+
+        m.optimize()
+        status = m.getStatus()
+        n_nodes = m.getNNodes()
+        return n_nodes, status == 'optimal'
+
+    except Exception:
+        # Any SCIP internal error → return large node count (worst return)
+        return 5000, False
 
 
 # ── Data recording branchrule ──────────────────────────────────────────────────
@@ -311,14 +329,40 @@ def collect_data_from_instance(instance_path, use_long_term=True, time_limit=Non
     return br.long_term_groups, br.sb_samples
 
 
-def collect_dataset(instance_paths, out_path, use_long_term=True):
+def collect_dataset(instance_paths, out_path, use_long_term=True,
+                    checkpoint_every=5):
     """
-    Collect data from multiple instances, save to disk.
+    Collect data from multiple instances with crash-safe checkpointing.
+
+    checkpoint_every: save partial progress every N instances (default 5).
+    On restart, automatically resumes from the last checkpoint.
     """
+    partial_path = out_path.replace('.pkl', '_partial.pkl')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # ── Resume from partial checkpoint if it exists ───────────────────────────
     all_long_term_groups = []
     all_sb_samples       = []
+    start_idx            = 0
 
+    if os.path.exists(partial_path):
+        try:
+            with open(partial_path, 'rb') as f:
+                saved = pickle.load(f)
+            all_long_term_groups = saved.get('long_term_groups', [])
+            all_sb_samples       = saved.get('sb_samples', [])
+            start_idx            = saved.get('completed_instances', 0)
+            print(f"  Resuming from instance {start_idx + 1}/{len(instance_paths)}"
+                  f"  ({len(all_sb_samples)} SB samples loaded)")
+        except Exception as e:
+            print(f"  Could not load partial progress ({e}), starting fresh")
+            start_idx = 0
+
+    # ── Collect remaining instances ────────────────────────────────────────────
     for i, path in enumerate(instance_paths):
+        if i < start_idx:
+            continue
+
         print(f"  Collecting from instance {i+1}/{len(instance_paths)}: {os.path.basename(path)}")
         try:
             lt_groups, sb_samps = collect_data_from_instance(path, use_long_term)
@@ -326,15 +370,26 @@ def collect_dataset(instance_paths, out_path, use_long_term=True):
             all_sb_samples.extend(sb_samps)
         except Exception as e:
             print(f"    Warning: failed on {path}: {e}")
-            continue
 
-    # Save collected data
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        # Save checkpoint every N instances
+        if (i + 1) % checkpoint_every == 0:
+            with open(partial_path, 'wb') as f:
+                pickle.dump({
+                    'long_term_groups':    all_long_term_groups,
+                    'sb_samples':          all_sb_samples,
+                    'completed_instances': i + 1,
+                }, f)
+            print(f"    [Checkpoint saved at instance {i+1}]")
+
+    # ── Final save to canonical path ───────────────────────────────────────────
     with open(out_path, 'wb') as f:
         pickle.dump({
             'long_term_groups': all_long_term_groups,
             'sb_samples':       all_sb_samples,
         }, f)
+
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
 
     print(f"Saved {len(all_sb_samples)} SB samples, "
           f"{sum(len(g) for g in all_long_term_groups)} long-term samples → {out_path}")

@@ -17,6 +17,7 @@ Usage:
 
 import os
 import argparse
+import shutil
 import torch
 import numpy as np
 import pickle
@@ -59,7 +60,6 @@ def main():
 
     print(f"\nDevice: {device}")
     if device == "cuda":
-        import torch
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
@@ -132,7 +132,7 @@ def main():
     if not args.skip_gcn:
         print(f"\n[4/5] Training GCN on {device}...")
         gcn = build_gcn(cfg)
-        initialize_prenorms(gcn, train_graphs[:min(1000, len(train_graphs))])
+        initialize_prenorms(gcn, train_graphs)
 
         trainer = GCNTrainer(gcn, device=device)
 
@@ -142,7 +142,6 @@ def main():
 
         trainer.fit(train_data, val_data, checkpoint_dir=cfg.CHECKPOINT_DIR)
         # Save with problem-specific name
-        import shutil
         best = os.path.join(cfg.CHECKPOINT_DIR, "gcn_best.pt")
         if os.path.exists(best):
             shutil.copy(best, gcn_path)
@@ -181,7 +180,8 @@ def main():
             features=node_feats[:split],
             labels=node_labels[:split],
             val_features=node_feats[split:],
-            val_labels=node_labels[split:]
+            val_labels=node_labels[split:],
+            checkpoint_path=node_mlp_path
         )
         trainer.save(node_mlp_path)
         print(f"  Saved NodeMLP → {node_mlp_path}")
