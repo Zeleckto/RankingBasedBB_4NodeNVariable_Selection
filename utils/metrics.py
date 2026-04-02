@@ -19,17 +19,15 @@ def shifted_geometric_mean(values, shift=1.0):
 
 
 def solve_instance(instance_path, branchrule=None, nodesel=None,
-                   time_limit=3600, seed=0, verbose=False):
+                   time_limit=3600, seed=0, verbose=False,
+                   paper_settings=True):
     """
     Solve one instance and return metrics.
 
-    Returns dict:
-        solve_time   : float (seconds, capped at time_limit if unsolved)
-        n_nodes      : int   (B&B nodes explored, None if unsolved)
-        status       : str   ('optimal', 'timelimit', 'infeasible', etc.)
-        obj_val      : float (best objective found)
-        primal_dual_gap : float
-        solved       : bool
+    paper_settings=True applies the exact SCIP settings from the paper (Section 5.1):
+        - Cuts at root node only
+        - No restarts
+        - randomization seeds for reproducibility
     """
     model = Model()
     if not verbose:
@@ -38,9 +36,16 @@ def solve_instance(instance_path, branchrule=None, nodesel=None,
     model.setParam("limits/time", time_limit)
     model.setParam("randomization/permutationseed", seed)
     model.setParam("randomization/lpseed", seed)
+
+    if paper_settings:
+        # Paper: "cutting planes enabled at the root node"
+        model.setParam("separating/maxroundsroot", -1)
+        model.setParam("separating/maxrounds",      0)
+        # Paper: "deactivate solver restarts" (following Gasse et al. Appendix)
+        model.setParam("presolving/maxrestarts", 0)
+
     model.readProblem(instance_path)
 
-    # Include custom branching rule
     if branchrule is not None:
         model.includeBranchrule(
             branchrule=branchrule,
@@ -51,7 +56,6 @@ def solve_instance(instance_path, branchrule=None, nodesel=None,
             maxbounddist=1.0
         )
 
-    # Include custom node selector
     if nodesel is not None:
         model.includeNodesel(
             nodesel=nodesel,

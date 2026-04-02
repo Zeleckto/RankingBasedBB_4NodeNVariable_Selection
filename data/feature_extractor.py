@@ -190,11 +190,16 @@ def extract_bipartite_graph(model):
         # 13: reduced cost normalized
         var_feats[j, 13] = rc / (abs(obj_val) + 1e-8)
 
-    # ── Candidate mask ────────────────────────────────────────────────────────
+    # ── Candidate mask (priority integer/binary candidates only) ──────────────
+    # Paper and PySCIPOpt docs: use npriocands, not ncands.
+    # nimplcands (implicit integers) should not be branched on in general.
     cand_mask = np.zeros(n_cols, dtype=bool)
     try:
-        cands, *_ = model.getLPBranchCands()
-        for var in cands:
+        raw = model.getLPBranchCands()
+        cands_all, _, _, ncands, npriocands, _ = raw
+        n_prio = npriocands if npriocands > 0 else ncands
+        prio_cands = cands_all[:n_prio]
+        for var in prio_cands:
             j = col_index.get(var.name, None)
             if j is not None:
                 cand_mask[j] = True
@@ -203,7 +208,13 @@ def extract_bipartite_graph(model):
         for j, col in enumerate(cols):
             var = col.getVar()
             if var.vtype() in ('B', 'I'):
-                lp_val = col.getPrimsol()
+                try:
+                    lp_val = col.getPrimsol()
+                except AttributeError:
+                    try:
+                        lp_val = var.getLPSol()
+                    except Exception:
+                        continue
                 frac = lp_val - np.floor(lp_val)
                 if 1e-6 < frac < 1 - 1e-6:
                     cand_mask[j] = True

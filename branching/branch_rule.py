@@ -69,53 +69,78 @@ class LearnedBranchRule(Branchrule):
     def _select_variable(self):
         """
         Returns the Variable to branch on.
+        Uses npriocands (priority integer/binary candidates) not ncands.
         Falls back to SCIP default if learned policy fails.
         """
-        # Get LP branch candidates
         result = self.model.getLPBranchCands()
         if result is None:
             return None
-        candidates, cand_sols, cand_fracs, ncands, *_ = result
-        if ncands == 0:
+
+        cands, cand_sols, cand_fracs, ncands, npriocands, nimplcands = result
+
+        # Use priority candidates only (paper and PySCIPOpt docs recommend this)
+        n_prio = npriocands if npriocands > 0 else ncands
+        if n_prio == 0:
             return None
+
+        prio_cands = cands[:n_prio]
+        prio_fracs = cand_fracs[:n_prio]
 
         if not self._use_learned:
-            # Strong branching mode — let SCIP handle it, we just log
             return None
 
-        # Extract features
         graph = extract_bipartite_graph(self.model)
         if graph is None or not graph["cand_mask"].any():
             return None
 
-        # Run GCN
-        logits, var_embeddings = self._run_gcn(graph)
+        # Store frac_sum using priority candidates only
+        graph["frac_sum"] = float(sum(min(f, 1.0-f) for f in prio_fracs))
+        graph["n_cols"]   = len(self.model.getLPColsData())
 
+        logits, var_embeddings = self._run_gcn(graph)
         if logits is None:
             return None
 
-        # Map cand_mask indices → candidate variables
-        cand_indices = np.where(graph["cand_mask"])[0]
-        if len(cand_indices) == 0:
+        # cand_mask marks all LP branch candidates in column order.
+        # logits[i] corresponds to the i-th True position in cand_mask.
+        # Map argmax logit → column index → variable name → find in prio_cands.
+        cols = self.model.getLPColsData()
+        cand_col_indices = np.where(graph["cand_mask"])[0]  # shape (n_cands_in_mask,)
+
+        if len(cand_col_indices) == 0:
             return None
 
-        # Select variable with highest logit
-        best_local_idx = logits.argmax().item()        # index into cand_mask subset
-        best_col_idx   = cand_indices[best_local_idx]  # index into all columns
+        # Restrict logits to priority candidates only:
+        # Build set of priority candidate names for fast lookup
+        prio_names = {v.name for v in prio_cands}
+        prio_mask_local = []   # indices into cand_col_indices that are prio candidates
+        for local_i, col_i in enumerate(cand_col_indices):
+            if col_i < len(cols) and cols[col_i].getVar().name in prio_names:
+                prio_mask_local.append(local_i)
 
-        # Get corresponding candidate variable
-        # candidates list is ordered by SCIP; we need to match by column index
-        # Use LP column data to find the variable
-        cols = self.model.getLPColsData()
+        if not prio_mask_local:
+            # Fallback: use all candidates
+            prio_mask_local = list(range(len(cand_col_indices)))
+
+        # Pick best among priority candidates
+        prio_logits = logits[prio_mask_local]
+        best_prio_local = prio_mask_local[int(prio_logits.argmax())]
+        best_col_idx    = cand_col_indices[best_prio_local]
+
+        # Match by name (robust to ordering differences between getLPColsData and getLPBranchCands)
         if best_col_idx < len(cols):
-            chosen_var = cols[best_col_idx].getVar()
+            best_name = cols[best_col_idx].getVar().name
+            chosen_var = None
+            for v in prio_cands:
+                if v.name == best_name:
+                    chosen_var = v
+                    break
+            if chosen_var is None:
+                chosen_var = prio_cands[0]   # safe fallback
         else:
-            # Fallback: pick first candidate
-            chosen_var = candidates[0]
+            chosen_var = prio_cands[0]
 
-        # ── Cache node embedding for current node ─────────────────────────────
         self._cache_current_node(var_embeddings, graph)
-
         return chosen_var
 
     def _run_gcn(self, graph):

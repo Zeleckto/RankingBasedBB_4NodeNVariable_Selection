@@ -122,12 +122,28 @@ class GCNTrainer:
         return total / max(n_batches, 1)
 
     def _get_local_idx(self, sample):
-        """Map sample.action_col_idx → index within cand_mask=True positions."""
+        """
+        Map sample.action_col_idx → index within cand_mask=True positions.
+
+        The GCN outputs logits[i] for the i-th True position in cand_mask.
+        We need to find which position i corresponds to action_col_idx.
+
+        searchsorted is WRONG if action_col_idx is not exactly in cand_positions —
+        it returns the insertion point, not the element index. Use np.where instead.
+        """
         cand_mask = sample.state_graph['cand_mask']
-        cand_positions = np.where(cand_mask)[0]
+        cand_positions = np.where(cand_mask)[0]   # column indices of all candidates
         col_idx = sample.action_col_idx
-        local = np.searchsorted(cand_positions, col_idx)
-        return int(np.clip(local, 0, len(cand_positions) - 1))
+
+        # Find exact match
+        matches = np.where(cand_positions == col_idx)[0]
+        if len(matches) > 0:
+            return int(matches[0])
+
+        # If no exact match (shouldn't happen in well-formed data):
+        # fall back to nearest candidate index
+        nearest = int(np.argmin(np.abs(cand_positions - col_idx)))
+        return nearest
 
     def evaluate(self, samples, graphs, rewards):
         """Compute validation loss (no gradient)."""

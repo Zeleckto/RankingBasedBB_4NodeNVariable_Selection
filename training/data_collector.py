@@ -31,27 +31,36 @@ import config as cfg
 
 # ── Strong branching helper ─────────────────────────────────────────────────────
 
-def get_sb_scores(model):
+def get_sb_scores(model, prio_cands=None, prio_fracs=None):
     """
-    Get strong branching scores for all LP branch candidates.
-    Returns dict: var_name → sb_score
+    Get strong branching scores for priority LP branch candidates.
 
-    Uses product scoring: score(x_i) = min(f_down, f_up) * max(f_down, f_up)
-    where f_down = frac, f_up = 1-frac. This approximates SB without LP solves.
-    For true SB scores, SCIP's vanillafullstrong plugin would be needed.
+    Uses product scoring: score(x_i) = min(f, 1-f)^2
+    where f = fractionality of x_i (distance to nearest integer).
+    This matches the dual-bound improvement proxy common in the literature.
+
+    Paper uses true SB (solve 2 LPs per candidate). That requires
+    SCIP's vanillafullstrong which is slow. This proxy is fast and
+    correctly ranks highly-fractional (near-0.5) variables highest.
+
+    Args:
+        prio_cands: list of Variables (priority candidates). If None, fetched.
+        prio_fracs: list of fracs matching prio_cands order. If None, fetched.
     """
-    try:
-        cands, cand_sols, cand_fracs, ncands, *_ = model.getLPBranchCands()
-    except Exception:
-        return {}
+    if prio_cands is None or prio_fracs is None:
+        try:
+            cands, _, fracs, ncands, npriocands, _ = model.getLPBranchCands()
+            n = npriocands if npriocands > 0 else ncands
+            prio_cands = cands[:n]
+            prio_fracs = fracs[:n]
+        except Exception:
+            return {}
 
     scores = {}
-    for var, sol_val, frac in zip(cands, cand_sols, cand_fracs):
-        f_down   = frac
-        f_up     = 1.0 - frac
-        sb_score = min(f_down, f_up) * max(f_down, f_up)
-        scores[var.name] = sb_score
-
+    for var, frac in zip(prio_cands, prio_fracs):
+        # Symmetric fractionality: distance to nearest integer
+        sym_frac = min(frac, 1.0 - frac)
+        scores[var.name] = sym_frac * sym_frac   # score ∈ [0, 0.25], max at frac=0.5
     return scores
 
 
@@ -147,12 +156,22 @@ class DataCollectionBranchRule(Branchrule):
             return {"result": SCIP_RESULT.DIDNOTRUN}
 
         try:
-            cands, cand_sols, cand_fracs, ncands, *_ = self.model.getLPBranchCands()
+            # Paper uses npriocands (priority candidates) not ncands.
+            # nimplcands are implicit integers — should not be branched on in general.
+            cands, cand_sols, cand_fracs, ncands, npriocands, nimplcands = \
+                self.model.getLPBranchCands()
         except Exception:
             return {"result": SCIP_RESULT.DIDNOTRUN}
 
-        if ncands == 0:
+        # Use npriocands: actual integer/binary priority candidates only
+        n_prio = npriocands if npriocands > 0 else ncands
+        if n_prio == 0:
             return {"result": SCIP_RESULT.DIDNOTRUN}
+
+        # Slice to priority candidates only (they are sorted first)
+        prio_cands = cands[:n_prio]
+        prio_sols  = cand_sols[:n_prio]
+        prio_fracs = cand_fracs[:n_prio]
 
         # Build column index map once
         cols        = self.model.getLPColsData()
@@ -166,13 +185,17 @@ class DataCollectionBranchRule(Branchrule):
             pass
         graph["node_number"] = node_num
 
-        # Fractionality sum — stored in graph for node selector features
-        frac_sum = float(sum(cand_fracs))
+        # frac_sum: sum of fractionalities of PRIORITY candidates only
+        # frac = distance to nearest integer for each candidate
+        frac_sum = float(sum(min(f, 1.0 - f) for f in prio_fracs))
         graph["frac_sum"] = frac_sum
         graph["n_cols"]   = len(cols)
 
-        # ── Short-term: record SB scores ──────────────────────────────────────
-        sb_scores = get_sb_scores(self.model)
+        # ── Short-term: record SB scores at current node ───────────────────────
+        # Note: Paper's D_SB is collected from SB decisions INSIDE the K rollout
+        # simulations. Here we record the best SB candidate at the current node
+        # as an approximation (rollout SB would require intercepting sub-SCIP runs).
+        sb_scores = get_sb_scores(self.model, prio_cands, prio_fracs)
         if sb_scores:
             best_var_name = max(sb_scores, key=sb_scores.get)
             best_col_idx  = col_idx_map.get(best_var_name, 0)
@@ -187,37 +210,50 @@ class DataCollectionBranchRule(Branchrule):
 
         # ── Long-term: sample K variables and roll out ─────────────────────────
         node_group = []
-        if self.use_long_term and ncands > 1:
-            # Snapshot current node's tightened bounds — replaces _get_current_branch_path()
-            # This is the accumulated effect of all branching decisions root→current node.
+        if self.use_long_term and n_prio > 1:
+            # Snapshot current node's tightened bounds.
+            # These ARE all accumulated branching decisions from root → current node.
             current_bounds = get_current_var_bounds(self.model)
 
-            k            = min(self.k_explore, ncands)
+            k            = min(self.k_explore, n_prio)
             rng          = np.random.RandomState()
-            sampled_vars = rng.choice(cands, size=k, replace=False)
-            sampled_fracs= {v.name: f for v, f in zip(cands, cand_fracs)}
+            sample_idx   = rng.choice(n_prio, size=k, replace=False)
+            sampled_vars = [prio_cands[i] for i in sample_idx]
+            sampled_sols = [prio_sols[i]  for i in sample_idx]
 
-            for var in sampled_vars:
-                frac     = sampled_fracs.get(var.name, 0.5)
-                floor_bd = float(int(var.getLbLocal() + frac * (var.getUbLocal() - var.getLbLocal())))
-                ceil_bd  = floor_bd + 1.0
+            for var, lp_sol in zip(sampled_vars, sampled_sols):
+                # Correct floor/ceil: branch at the LP solution value
+                # floor_bd = floor(x*), ceil_bd = ceil(x*)
+                floor_bd = float(np.floor(lp_sol))
+                ceil_bd  = float(np.ceil(lp_sol))
 
-                # LEFT branch: add ub = floor_bd
+                if floor_bd >= ceil_bd - 1e-8:
+                    # LP solution is already nearly integer, skip
+                    continue
+
+                # Per paper Figure 1: each variable gets ONE trajectory return R_ei
+                # from rolling out the simulation tree T_ei. We run both children
+                # and take the return from the better child (paper does not specify
+                # which child to follow; using min nodes = best return is conservative).
                 n_left, _  = solve_subproblem(
                     self.instance_path, current_bounds,
                     extra_branch=(var.name, 'ub', floor_bd), time_limit=60)
 
-                # RIGHT branch: add lb = ceil_bd
                 n_right, _ = solve_subproblem(
                     self.instance_path, current_bounds,
                     extra_branch=(var.name, 'lb', ceil_bd), time_limit=60)
 
-                # Return = -min(nodes) → higher return = smaller sub-tree
+                # R_ei = -nodes explored. Higher = smaller tree = better.
+                # Use min(n_left, n_right): best reachable outcome from branching on x_e.
                 traj_return = -float(min(n_left, n_right))
+
+                col_idx = col_idx_map.get(var.name, None)
+                if col_idx is None:
+                    continue
 
                 sample = NodeSample(
                     state_graph       = graph,
-                    action_col_idx    = col_idx_map.get(var.name, 0),
+                    action_col_idx    = col_idx,
                     trajectory_return = traj_return,
                 )
                 node_group.append(sample)
@@ -225,7 +261,7 @@ class DataCollectionBranchRule(Branchrule):
             if node_group:
                 self.long_term_groups.append(node_group)
 
-                # Select best long-term action and commit
+                # Select best long-term action (green node in paper Figure 1) and commit
                 returns  = [s.trajectory_return for s in node_group]
                 best_idx = int(np.argmax(returns))
                 self.model.branchVar(sampled_vars[best_idx])
@@ -240,6 +276,10 @@ class DataCollectionBranchRule(Branchrule):
 def collect_data_from_instance(instance_path, use_long_term=True, time_limit=None):
     """
     Run one instance through data collection.
+    SCIP settings match the paper (Section 5.1):
+        - Cutting planes at root node only
+        - No restarts
+        - All other SCIP parameters default
     Returns (long_term_groups, sb_samples) for reward assignment.
     """
     time_limit = time_limit or cfg.SCIP_TIME_LIMIT
@@ -247,9 +287,16 @@ def collect_data_from_instance(instance_path, use_long_term=True, time_limit=Non
     model = Model()
     model.hideOutput(True)
     model.setParam("limits/time", time_limit)
+
+    # ── Paper Section 5.1 exact SCIP settings ─────────────────────────────────
+    # "cutting planes enabled at the root node"
+    model.setParam("separating/maxroundsroot", -1)   # unlimited cuts at root
+    model.setParam("separating/maxrounds",      0)   # no cuts after root
+    # "deactivate solver restarts" (following Gasse et al.)
+    model.setParam("presolving/maxrestarts", 0)
+
     model.readProblem(instance_path)
 
-    # Include our data collection branching rule
     br = DataCollectionBranchRule(instance_path, use_long_term=use_long_term)
     model.includeBranchrule(
         branchrule=br,
@@ -261,7 +308,6 @@ def collect_data_from_instance(instance_path, use_long_term=True, time_limit=Non
     )
 
     model.optimize()
-
     return br.long_term_groups, br.sb_samples
 
 
