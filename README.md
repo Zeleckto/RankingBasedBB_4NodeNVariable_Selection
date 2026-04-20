@@ -21,7 +21,7 @@ This repository implements and extends **Branch Ranking** (Huang et al., ECML-PK
 
 ### The Problem: Mixed-Integer Programming
 
-Mixed-Integer Programming (MIP) is a class of optimization problems where some variables must take integer values:
+Mixed-Integer Programming (MIP) is a class of optimization problems where some variables must take integer values
 
 ```
 min  c^T x
